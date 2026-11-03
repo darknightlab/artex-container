@@ -1,0 +1,267 @@
+name: Docker
+
+# Builds the ARTEX container image from upstream source and publishes it to GHCR.
+#
+# This repository intentionally holds no sources. Upstream
+# (https://github.com/BaaRai/ARTEX) ships a runtime-only Dockerfile: it expects
+# pre-built Linux binaries at dist/<arch>/artex, and its own CI is supposed to
+# cross-compile them (pure Go, no QEMU for the compile step). So this workflow:
+#
+#   1. checks out the upstream ref (default: main) into ./context,
+#   2. builds the Next.js static export once and cross-compiles the linux/amd64
+#      and linux/arm64 binaries with upstream's own build.sh,
+#   3. builds the multi-arch image with the upstream Dockerfile (only the apt /
+#      npm / pip layers run under emulation for arm64) and pushes it to GHCR.
+#
+# Result: ghcr.io/darknightlab/artex-container:latest plus sha-<upstream sha>.
+# Docker Hub is optional: set the DOCKER_USERNAME / DOCKER_PASSWORD secrets to
+# also publish docker.io/<DOCKER_USERNAME>/artex.
+
+on:
+    push:
+        branches: ["main"]
+    pull_request:
+        branches: ["main"]
+    schedule:
+        # Weekly rebuild of upstream main, so the image keeps tracking upstream
+        # even when this repository sees no commits.
+        - cron: "0 6 * * 1"
+    workflow_dispatch:
+        inputs:
+            upstream_ref:
+                description: "Upstream BaaRai/ARTEX ref to build (branch, tag or commit)"
+                required: true
+                default: main
+            platforms:
+                description: "Target platforms (comma separated)"
+                required: true
+                default: "linux/amd64,linux/arm64"
+
+concurrency:
+    group: ${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+env:
+    # Use docker.io for Docker Hub if empty
+    REGISTRY: ghcr.io
+    # github.repository as <account>/<repo>
+    IMAGE_NAME: ${{ github.repository }}
+    UPSTREAM_REPO: BaaRai/ARTEX
+    UPSTREAM_REF: ${{ github.event.inputs.upstream_ref || 'main' }}
+    PLATFORMS: ${{ github.event.inputs.platforms || 'linux/amd64,linux/arm64' }}
+    # Empty unless the repository defines the DOCKER_USERNAME / DOCKER_PASSWORD
+    # secrets; the Docker Hub steps below are skipped in that case.
+    DOCKERHUB_USER: ${{ secrets.DOCKER_USERNAME }}
+
+jobs:
+    build_and_push_to_registries:
+        name: Push Docker image to multiple registries
+        runs-on: ubuntu-latest
+        timeout-minutes: 360
+        permissions:
+            contents: read
+            packages: write
+            # This is used to complete the identity challenge
+            # with sigstore/fulcio when running outside of PRs.
+            id-token: write
+
+        steps:
+            # ------------------------------------------------------------------
+            # upstream source
+            # ------------------------------------------------------------------
+            - name: Checkout upstream ARTEX
+              uses: actions/checkout@v4
+              with:
+                  repository: ${{ env.UPSTREAM_REPO }}
+                  ref: ${{ env.UPSTREAM_REF }}
+                  path: context
+                  # Tags are required for `git describe`, which feeds both the
+                  # version embedded into the binary and the image tag.
+                  fetch-depth: 0
+
+            - name: Resolve upstream revision
+              id: upstream
+              working-directory: context
+              run: |
+                  set -euo pipefail
+                  sha=$(git rev-parse HEAD)
+                  version=$(git describe --tags --always)
+                  tag=$(git describe --tags --exact-match HEAD 2>/dev/null || true)
+                  {
+                    echo "sha=$sha"
+                    echo "short=${sha:0:12}"
+                    echo "version=${version#v}"
+                    echo "tag=$tag"
+                  } >> "$GITHUB_OUTPUT"
+                  echo "upstream ${UPSTREAM_REPO}@${sha} (${version})"
+
+            # ------------------------------------------------------------------
+            # binaries expected by the upstream Dockerfile (dist/<arch>/artex)
+            # ------------------------------------------------------------------
+            - name: Set up Go
+              uses: actions/setup-go@v5
+              with:
+                  go-version-file: context/go.mod
+                  cache: true
+                  cache-dependency-path: context/go.sum
+
+            - name: Set up Node
+              uses: actions/setup-node@v4
+              with:
+                  node-version: "22"
+                  cache: npm
+                  cache-dependency-path: context/web/package-lock.json
+
+            - name: Build frontend and Linux binaries
+              working-directory: context
+              env:
+                  # build.sh builds every target in ARTEX_TARGETS in one pass and
+                  # reuses the single frontend static export.
+                  ARTEX_TARGETS: linux/amd64,linux/arm64
+                  ARTEX_BUILD_VERSION: ${{ steps.upstream.outputs.tag || steps.upstream.outputs.version }}
+                  ARTEX_OUTPUT_DIR: dist
+                  # UPX-compressed binaries are known to crash on some kernels and
+                  # security policies; upstream releases keep it off as well.
+                  ARTEX_COMPRESS: "0"
+              run: |
+                  set -euo pipefail
+                  ./build.sh
+                  mkdir -p dist/amd64 dist/arm64
+                  install -m 0755 dist/artex-linux-amd64/artex dist/amd64/artex
+                  install -m 0755 dist/artex-linux-arm64/artex dist/arm64/artex
+                  rm -rf dist/artex-linux-amd64 dist/artex-linux-arm64
+                  ls -lh dist/amd64/artex dist/arm64/artex
+
+            - name: Smoke test binaries
+              working-directory: context
+              run: |
+                  set -euo pipefail
+                  file dist/amd64/artex dist/arm64/artex
+                  file dist/amd64/artex | grep -q 'x86-64'
+                  file dist/arm64/artex | grep -q 'aarch64'
+                  # `-h` prints the flag set; Go's flag package may exit non-zero,
+                  # so only the output is asserted.
+                  out=$(./dist/amd64/artex -h 2>&1 || true)
+                  printf '%s\n' "$out" | head -5
+                  printf '%s\n' "$out" | grep -q -- '-addr'
+
+            # ------------------------------------------------------------------
+            # image
+            # ------------------------------------------------------------------
+            - name: Setup QEMU
+              uses: docker/setup-qemu-action@v3
+
+            # Workaround: https://github.com/docker/build-push-action/issues/461
+            - name: Setup Docker buildx
+              uses: docker/setup-buildx-action@v3
+
+            # Install the cosign tool except on PR
+            # https://github.com/sigstore/cosign-installer
+            - name: Install cosign
+              if: github.event_name != 'pull_request'
+              uses: sigstore/cosign-installer@v3
+
+            # Image names and tags, computed here because the tag set depends on
+            # the upstream ref (upstream release tag) and on the trigger (weekly
+            # schedule marker) and on whether Docker Hub is configured.
+            - name: Compute image metadata
+              id: image
+              env:
+                  SHORT: ${{ steps.upstream.outputs.short }}
+                  RELEASE_TAG: ${{ steps.upstream.outputs.tag }}
+              run: |
+                  set -euo pipefail
+                  # explicit `type=raw`: the value is taken verbatim (metadata-action
+                  # would otherwise also parse a bare value as raw, but be explicit)
+                  tags=()
+                  if [ "$GITHUB_REF" = "refs/heads/main" ]; then tags+=("type=raw,value=latest"); fi
+                  tags+=("type=raw,value=sha-${SHORT}")
+                  if [ -n "${RELEASE_TAG:-}" ]; then tags+=("type=raw,value=${RELEASE_TAG#v}"); fi
+                  if [ "$GITHUB_EVENT_NAME" = "schedule" ]; then tags+=("type=raw,value=edge-$(date -u +%Y%m%d)"); fi
+                  imgs=("${REGISTRY}/${IMAGE_NAME}")
+                  if [ -n "${DOCKERHUB_USER:-}" ] && [ "$GITHUB_EVENT_NAME" != "pull_request" ]; then
+                    imgs+=("docker.io/${DOCKERHUB_USER}/${IMAGE_NAME##*/}")
+                  fi
+                  images=$(printf '%s\n' "${imgs[@]}")
+                  tag_list=$(printf '%s\n' "${tags[@]}")
+                  test -n "$images" && test -n "$tag_list"
+                  echo "--- images"; echo "$images"
+                  echo "--- tags"; echo "$tag_list"
+                  {
+                    echo "images<<__EOF__"; echo "$images"; echo "__EOF__"
+                    echo "tags<<__EOF__"; echo "$tag_list"; echo "__EOF__"
+                  } >> "$GITHUB_OUTPUT"
+
+            - name: Log in to Docker Hub
+              if: github.event_name != 'pull_request' && env.DOCKERHUB_USER != ''
+              uses: docker/login-action@v3
+              with:
+                  username: ${{ secrets.DOCKER_USERNAME }}
+                  password: ${{ secrets.DOCKER_PASSWORD }}
+
+            # Login against a registry except on PR
+            # https://github.com/docker/login-action
+            - name: Log into registry ${{ env.REGISTRY }}
+              if: github.event_name != 'pull_request'
+              uses: docker/login-action@v3
+              with:
+                  registry: ${{ env.REGISTRY }}
+                  username: ${{ github.actor }}
+                  password: ${{ secrets.GITHUB_TOKEN }}
+
+            # Extract metadata (tags, labels) for Docker
+            # https://github.com/docker/metadata-action
+            - name: Extract Docker metadata
+              id: meta
+              uses: docker/metadata-action@v5
+              with:
+                  images: ${{ steps.image.outputs.images }}
+                  tags: ${{ steps.image.outputs.tags }}
+
+            # Build and push Docker image with Buildx (don't push on PR).
+            # The upstream Dockerfile only installs runtime tools and copies
+            # dist/${TARGETARCH}/artex, so nothing is compiled inside the image.
+            - name: Build and push Docker image
+              id: build-and-push
+              uses: docker/build-push-action@v6
+              with:
+                  context: context
+                  platforms: ${{ env.PLATFORMS }}
+                  push: ${{ github.event_name != 'pull_request' }}
+                  tags: ${{ steps.meta.outputs.tags }}
+                  labels: |
+                      ${{ steps.meta.outputs.labels }}
+                      org.opencontainers.image.upstream=${{ env.UPSTREAM_REPO }}
+                      org.opencontainers.image.upstream-revision=${{ steps.upstream.outputs.sha }}
+                      org.opencontainers.image.upstream-version=${{ steps.upstream.outputs.version }}
+                  cache-from: type=gha
+                  cache-to: type=gha,mode=max
+
+            # Sign the resulting Docker image digest except on PRs.
+            - name: Sign the published Docker image
+              if: ${{ github.event_name != 'pull_request' }}
+              env:
+                  COSIGN_EXPERIMENTAL: "true"
+                  DIGEST: ${{ steps.build-and-push.outputs.digest }}
+              run: |
+                  test -n "$DIGEST"
+                  cosign sign --yes "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}@${DIGEST}"
+
+            - name: Summary
+              if: github.event_name != 'pull_request'
+              env:
+                  DIGEST: ${{ steps.build-and-push.outputs.digest }}
+                  TAGS: ${{ steps.meta.outputs.tags }}
+              run: |
+                  {
+                    echo "### ARTEX image published"
+                    echo
+                    echo "- upstream: \`${UPSTREAM_REPO}@${{ steps.upstream.outputs.sha }}\`"
+                    echo "- version: \`${{ steps.upstream.outputs.version }}\`"
+                    echo "- platforms: \`${PLATFORMS}\`"
+                    echo "- digest: \`${DIGEST}\`"
+                    echo
+                    echo '```'
+                    echo "$TAGS"
+                    echo '```'
+                  } >> "$GITHUB_STEP_SUMMARY"
